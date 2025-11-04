@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from typing import List
+from typing import List, Optional
 from itertools import product
 import numpy as np
 
@@ -152,22 +152,26 @@ class ApproximateHessian(LinearOperator):
         self.symm = symm
         self.initialized = initialized
 
+        self.B: np.ndarray = None
+        self.evals: np.ndarray = None
+        self.evecs: np.ndarray = None
         self.set_B(B0)
 
-    def set_B(self, target):
+    def set_B(self, target: np.ndarray) -> None:
         if target is None:
             self.B = None
             self.evals = None
             self.evecs = None
             self.initialized = False
             return
-        elif np.isscalar(target):
-            target = target * np.eye(self.dim)
+        if np.isscalar(target):
+            B = float(target) * np.eye(self.dim)
         else:
-            self.initialized = True
-        assert target.shape == self.shape
-        self.B = target
+            B = target
+            assert B.shape == self.shape, (B.shape, self.shape)
+        self.B = B
         self.evals, self.evecs = eigh(self.B)
+        self.initialized = True
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
@@ -189,7 +193,7 @@ class ApproximateHessian(LinearOperator):
         self.set_B(update_H(B, dx, dg, method=self.update_method,
                             symm=self.symm, lams=self.evals, vecs=self.evecs))
 
-    def project(self, U):
+    def project(self, U: np.ndarray) -> 'ApproximateHessian':
         """Project B into the subspace defined by U."""
         m, n = U.shape
         assert m == self.dim
@@ -223,11 +227,11 @@ class ApproximateHessian(LinearOperator):
     def _rmatmat(self, X):
         return self.matmat(X)
 
-    def __add__(self, other):
+    def __add__(self, other) -> 'ApproximateHessian':
         initialized = self.initialized
         if isinstance(other, ApproximateHessian):
-            other = other.B
             initialized = initialized and other.initialized
+            other = other.B
         if not self.initialized or other is None:
             tot = None
             initialized = False

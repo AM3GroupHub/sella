@@ -685,7 +685,7 @@ class BaseInternals:
             jacs,
         ).asarray()
 
-    def hessian(self) -> np.ndarray:
+    def hessian(self) -> SparseInternalHessians:
         """Calculates the Hessian matrix for each internal coordinate."""
         self._cache_check()
         if 'hessian' not in self._cache:
