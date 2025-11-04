@@ -245,8 +245,8 @@ class Sella(Optimizer):
                 ev = True
             else:
                 Unred = self.pes.get_Unred()
-                ev = (self.pes.get_HL().project(Unred)
-                                       .evals[:self.ord] > 0).any()
+                evals = self.pes.get_HL().project(Unred).evals
+                ev = (evals[:self.ord] > 0).any() or (evals[self.ord:] < 0).any()
         else:
             ev = False
 
