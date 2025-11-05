@@ -5,7 +5,7 @@ import numpy as np
 from scipy.linalg import eigh
 
 from ase import Atoms
-from ase.io.trajectory import Trajectory, TrajectoryWriter
+from ase.io.trajectory import TrajectoryWriter
 from ase.optimize.optimize import Optimizer
 
 from sella.peswrapper import PES
@@ -31,6 +31,7 @@ class IRC(Optimizer):
         gamma: float = 0.1,
         peskwargs: Optional[Dict[str, Any]] = None,
         keep_going: bool = False,
+        diag_every_n: Optional[int] = None,
         **kwargs
     ):
         Optimizer.__init__(
@@ -74,6 +75,8 @@ class IRC(Optimizer):
         self.xi = 1.
         self.first = True
         self.keep_going = keep_going
+        self.nsteps_since_diag = 0
+        self.diag_every_n = np.inf if diag_every_n is None else diag_every_n
 
     def irun(
         self,
@@ -124,8 +127,14 @@ class IRC(Optimizer):
 
     def step(self):
         if self.first:
-            self.pes.kick(self.d1)
+            self.pes.kick(self.d1, **self.peskwargs)
             self.first = False
+        else:
+            if self.nsteps_since_diag >= self.diag_every_n:
+                self.pes.kick(self.d1, diag=True, **self.peskwargs)
+                self.nsteps_since_diag = 0
+            else:
+                self.nsteps_since_diag += 1
         for n in range(self.ninner_iter):
             s, smag = IRCTrustRegion(
                 self.pes,
@@ -140,7 +149,7 @@ class IRC(Optimizer):
             bound_clip = abs(smag - self.dx) < 1e-8
             self.d1 += s
 
-            self.pes.kick(s)
+            self.pes.kick(s, **self.peskwargs)
             g1 = self.pes.get_g()
 
             d1m = self.d1 * self.sqrtm
