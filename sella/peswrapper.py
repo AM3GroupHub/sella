@@ -1,4 +1,4 @@
-from typing import Union, Callable
+from typing import Union, Callable, Tuple
 
 import numpy as np
 from scipy.linalg import eigh
@@ -92,13 +92,13 @@ class PES:
 
         self.hessian_function = hessian_function
 
-    apos = property(lambda self: self.atoms.positions.copy())
-    dpos = property(lambda self: None)
+    apos: np.ndarray = property(lambda self: self.atoms.positions.copy())
+    dpos: np.ndarray = property(lambda self: None)
 
-    def save(self):
+    def save(self) -> None:
         self.savepoint = dict(apos=self.apos, dpos=self.dpos)
 
-    def restore(self):
+    def restore(self) -> None:
         apos = self.savepoint['apos']
         dpos = self.savepoint['dpos']
         assert apos is not None
@@ -107,16 +107,16 @@ class PES:
             self.dummies.positions = dpos
 
     # Position getter/setter
-    def set_x(self, target):
+    def set_x(self, target: np.ndarray):
         diff = target - self.get_x()
         self.atoms.positions = target.reshape((-1, 3))
         return diff, diff, self.curr.get('g', np.zeros_like(diff))
 
-    def get_x(self):
+    def get_x(self) -> np.ndarray:
         return self.apos.ravel().copy()
 
     # Hessian getter/setter
-    def get_H(self):
+    def get_H(self) -> ApproximateHessian:
         return self.H
 
     def set_H(self, target, *args, **kwargs):
@@ -125,21 +125,21 @@ class PES:
         )
 
     # Hessian of the constraints
-    def get_Hc(self):
+    def get_Hc(self) -> np.ndarray:
         return self.cons.hessian().ldot(self.curr['L'])
 
     # Hessian of the Lagrangian
-    def get_HL(self):
+    def get_HL(self) -> ApproximateHessian:
         return self.get_H() - self.get_Hc()
 
     # Getters for constraints and their derivatives
     def get_res(self):
         return self.cons.residual()
 
-    def get_drdx(self):
+    def get_drdx(self) -> np.ndarray:
         return self.cons.jacobian()
 
-    def _calc_basis(self):
+    def _calc_basis(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         drdx = self.get_drdx()
         U, S, VT = np.linalg.svd(drdx)
         ncons = np.sum(S > 1e-6)
@@ -187,7 +187,6 @@ class PES:
                 new_point = False
             else:
                 return False
-        drdx, Ucons, Unred, Ufree = self._calc_basis()
 
         if feval:
             f, g = self.eval()
