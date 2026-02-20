@@ -1,3 +1,7 @@
+[project]
+name = "sella"
+version = "2.3.5"
+
 [build-system]
 requires = [
     "setuptools >= 54.2.0",
