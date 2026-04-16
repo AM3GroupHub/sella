@@ -80,10 +80,3 @@ testpaths = ["tests"]
 [tool.cython]
 compile_time_env = {}
 compiler_directives = { language_level = 3, wraparound = false, cdivision = true }
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-
-[tool.cython]
-compile_time_env = {}
-compiler_directives = { language_level = 3, wraparound = false, cdivision = true }
