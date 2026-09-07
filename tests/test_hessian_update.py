@@ -1,9 +1,12 @@
 import pytest
 import numpy as np
+from scipy.linalg import eigh, lstsq
 
 from test_utils import get_matrix
 
-from sella.hessian_update import update_H
+from sella.hessian_update import (
+    update_H, symmetrize_Y, _MS_TS_BFGS, _MS_PSB,
+)
 
 
 @pytest.mark.parametrize("dim,subdim,method,symm, pd",
@@ -43,3 +46,49 @@ def test_update_H(dim, subdim, method, symm, pd):
         B4 = update_H(B, S.ravel() / 1e12, Y.ravel() / 1e12, method=method,
                       symm=symm)
         np.testing.assert_allclose(B, B4, atol=0, rtol=0)
+
+
+def test_rank_one_ts_bfgs_matches_general_formula():
+    """The rank-one fast path must match the old multi-secant expression."""
+    rng = np.random.RandomState(2)
+    dim = 50
+    A = rng.normal(size=(dim, dim))
+    B = 0.5 * (A + A.T)
+    S = rng.normal(size=(dim, 1))
+    Y = rng.normal(size=(dim, 1))
+    lams, vecs = eigh(B)
+
+    J = Y - B @ S
+    X1 = S.T @ Y @ Y.T
+    absBS = vecs @ (np.abs(lams[:, np.newaxis]) * (vecs.T @ S))
+    X2 = S.T @ absBS @ absBS.T
+    XS = (X1 + X2) @ S
+    if np.linalg.cond(XS) > 1e12:
+        expected = _MS_PSB(B, S, Y)
+    else:
+        U = lstsq(XS, X1 + X2)[0].T
+        UJT = U @ J.T
+        expected = (UJT + UJT.T) - U @ (J.T @ S) @ U.T
+
+    actual = _MS_TS_BFGS(B, S, Y, lams, vecs)
+    np.testing.assert_allclose(actual, expected, atol=1e-12, rtol=1e-12)
+
+
+@pytest.mark.parametrize('method', [0, 1, 2])
+def test_symmetrize_Y_enforces_symmetric_secant_products(method):
+    """Every Y symmetrization method must make S.T @ Y symmetric."""
+    rng = np.random.default_rng(7)
+    S = rng.normal(size=(8, 3))
+    Y = rng.normal(size=(8, 3))
+    original_product = S.T @ Y
+
+    assert not np.allclose(original_product, original_product.T)
+
+    Y_symmetric = symmetrize_Y(S, Y, symm=method)
+    corrected_product = S.T @ Y_symmetric
+
+    np.testing.assert_allclose(
+        corrected_product, corrected_product.T, atol=1e-12
+    )
+    np.testing.assert_array_equal(Y_symmetric[:, 0], Y[:, 0])
+    assert not np.allclose(Y_symmetric, Y)

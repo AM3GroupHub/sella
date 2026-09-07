@@ -1,26 +1,30 @@
 #!/usr/bin/env python
 
-from typing import List, Optional
-from itertools import product
+from typing import List
 import numpy as np
 
 from sella.hessian_update import update_H
+from sella import _gpu as _gpu_mod
+from sella._gpu import gpu_eigh, gpu_eigh_t, to_gpu
 
 from scipy.sparse.linalg import LinearOperator
-from scipy.linalg import eigh
 
 
 class NumericalHessian(LinearOperator):
     dtype = np.dtype('float64')
 
-    def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None):
+    def __init__(self, func, x0, g0, eta, threepoint=False, Uproj=None,
+                 evaluation_callback=None):
         self.func = func
         self.x0 = x0.copy()
         self.g0 = g0.copy()
         self.eta = eta
         self.threepoint = threepoint
         self.calls = 0
+        self.evaluations = 0
         self.Uproj = Uproj
+        self.evaluation_callback = evaluation_callback
+        self.requires_secant_rank_cleanup = False
 
         self.ntrue = len(self.x0)
 
@@ -30,10 +34,17 @@ class NumericalHessian(LinearOperator):
         else:
             n = self.ntrue
 
-        self.shape = (n, n)
+        super().__init__(self.dtype, (n, n))
 
         self.Vs = np.empty((self.ntrue, 0), dtype=self.dtype)
         self.AVs = np.empty((self.ntrue, 0), dtype=self.dtype)
+
+    def _evaluate(self, x):
+        result = self.func(x)
+        self.evaluations += 1
+        if self.evaluation_callback is not None:
+            self.evaluation_callback(self.evaluations)
+        return result
 
     def _matvec(self, v):
         self.calls += 1
@@ -78,9 +89,13 @@ class NumericalHessian(LinearOperator):
                 return np.zeros(self.Uproj.shape[1])
             return np.zeros_like(v)
         vnorm *= sign
-        _, gplus = self.func(self.x0 + self.eta * v.ravel() / vnorm)
+        _, gplus = self._evaluate(
+            self.x0 + self.eta * v.ravel() / vnorm
+        )
         if self.threepoint:
-            fminus, gminus = self.func(self.x0 - self.eta * v.ravel() / vnorm)
+            _, gminus = self._evaluate(
+                self.x0 - self.eta * v.ravel() / vnorm
+            )
             Av = vnorm * (gplus - gminus) / (2 * self.eta)
         else:
             Av = vnorm * (gplus - self.g0) / self.eta
@@ -108,8 +123,8 @@ class MatrixSum(LinearOperator):
         # For example, if two matrices are provided with the detypes
         # np.int64 and np.float64, then this MatrixSum object will be
         # np.float64.
-        self.dtype = sorted([mat.dtype for mat in matrices], reverse=True)[0]
-        self.shape = matrices[0].shape
+        dtype = sorted([mat.dtype for mat in matrices], reverse=True)[0]
+        super().__init__(dtype, matrices[0].shape)
 
         mnum = None
         self.matrices = []
@@ -147,31 +162,83 @@ class ApproximateHessian(LinearOperator):
         B0: np.ndarray = None,
         update_method: str = 'TS-BFGS',
         symm: int = 2,
-        initialized: bool = False,
+        initialized=None,
     ) -> None:
         """A wrapper object for the approximate Hessian matrix."""
         self.dim = dim
         self.ncart = ncart
-        self.shape = (self.dim, self.dim)
-        self.dtype = np.float64
+        super().__init__(np.float64, (dim, dim))
         self.update_method = update_method
         self.symm = symm
-        self.initialized = initialized
+        self.initialized = False
         # Lazy eigendecomposition: only compute when needed
         self._evals = None
         self._evecs = None
         self._eigen_computed = False
+        # Lazy GPU upload of B, shared with downstream consumers
+        # (projection, etc.) so a single (N,N) transfer covers the step.
+        self._B_gpu = None
+        # Cached torch eigvals/eigvecs alongside the numpy versions, so the
+        # GPU-resident TS-BFGS update can read them without re-uploading.
+        self._evals_gpu = None
+        self._evecs_gpu = None
+        # True when self.B is the current Hessian.  GPU TS-BFGS can update the
+        # device copy without immediately downloading the full dense matrix.
+        self._cpu_current = True
 
-        self.B: np.ndarray = None
-        self.evals: np.ndarray = None
-        self.evecs: np.ndarray = None
-        self.set_B(B0)
+        self.set_B(B0, initialized=initialized)
 
     def _ensure_eigen_computed(self):
-        """Compute eigendecomposition if not already done."""
-        if not self._eigen_computed and self.B is not None:
-            self._evals, self._evecs = eigh(self.B)
-            self._eigen_computed = True
+        """Compute eigendecomposition if not already done.
+
+        Prefers the GPU-tensor path when B_gpu is cached so the eigvecs stay
+        on device for downstream consumers (e.g. _MS_TS_BFGS), while still
+        producing the numpy copies the rest of Sella expects.
+        """
+        if self._eigen_computed:
+            return
+        if self.B is None and self._B_gpu is None:
+            return
+        B_gpu = self._get_B_gpu()
+        if B_gpu is not None:
+            evals_t, evecs_t = gpu_eigh_t(B_gpu)
+            if evals_t is not None:
+                self._evals_gpu = evals_t
+                self._evecs_gpu = evecs_t
+                self._evals = evals_t.cpu().numpy()
+                self._evecs = evecs_t.cpu().numpy()
+                self._eigen_computed = True
+                return
+        # CPU fallback (no GPU or OOM)
+        self._evals, self._evecs = gpu_eigh(self.asarray(), A_gpu=None)
+        self._eigen_computed = True
+
+    def _get_B_gpu(self):
+        """Return cached torch tensor of B on GPU, uploading lazily.
+
+        Returns None when no GPU is available, when B is below the size
+        threshold, or when an upload attempt has previously OOM'd.
+        """
+        if self._B_gpu is not None:
+            return self._B_gpu
+        if self.B is None:
+            return None
+        if _gpu_mod._gpu_ok(self.B.shape[0]):
+            self._B_gpu = to_gpu(self.asarray())
+        return self._B_gpu
+
+    def _sync_B_cpu(self):
+        """Materialize a current numpy copy of B when it is GPU-resident."""
+        if self._cpu_current:
+            return
+        if self._B_gpu is None:
+            raise RuntimeError("Hessian CPU copy is stale and no GPU copy exists")
+        try:
+            self.B = self._B_gpu.cpu().numpy()
+        except (RuntimeError, MemoryError):
+            _gpu_mod._record_oom(self._B_gpu.shape[0])
+            raise
+        self._cpu_current = True
 
     @property
     def evals(self):
@@ -197,100 +264,193 @@ class ApproximateHessian(LinearOperator):
         if value is None:
             self._eigen_computed = False
 
-    def set_B(self, target):
+    def set_B(self, target, initialized=None):
         if target is None:
             self.B = None
             self._evals = None
             self._evecs = None
             self._eigen_computed = False
+            self._B_gpu = None
+            self._evals_gpu = None
+            self._evecs_gpu = None
+            self._cpu_current = True
             self.initialized = False
             return
-        if np.isscalar(target):
-            B = float(target) * np.eye(self.dim)
+        elif np.isscalar(target):
+            target = target * np.eye(self.dim)
+            if initialized is not None:
+                self.initialized = initialized
         else:
-            self.initialized = True
+            self.initialized = True if initialized is None else initialized
         assert target.shape == self.shape
         self.B = target
+        self._cpu_current = True
         # Mark eigendecomposition as stale - will recompute on next access
         self._eigen_computed = False
+        # B has changed, so the GPU copies are stale. Don't re-upload eagerly:
+        # _get_B_gpu does it lazily on next read.
+        self._B_gpu = None
+        self._evals_gpu = None
+        self._evecs_gpu = None
+
+    def _set_from_gpu(self, B_numpy, B_gpu):
+        """Install (numpy, torch) copies of B that are already in sync.
+
+        Used by `update()` to avoid the round-trip when the GPU TS-BFGS path
+        produced both a numpy result and the same tensor on device.
+        """
+        if B_numpy is not None:
+            assert B_numpy.shape == self.shape
+            self.B = B_numpy
+            self._cpu_current = True
+        else:
+            assert B_gpu is not None and tuple(B_gpu.shape) == self.shape
+            self.B = None
+            self._cpu_current = False
+        self.initialized = True
+        self._B_gpu = B_gpu
+        self._eigen_computed = False
+        self._evals = None
+        self._evecs = None
+        self._evals_gpu = None
+        self._evecs_gpu = None
 
     def update(self, dx, dg):
         """Perform a quasi-Newton update on B"""
-        if self.B is None:
-            B = np.zeros(self.shape, dtype=self.dtype)
-        else:
-            B = self.B.copy()
         if not self.initialized:
-            self.initialized = True
-            dx_cart = dx[:self.ncart]
-            dg_cart = dg[:self.ncart]
-            B[:self.ncart, :self.ncart] = update_H(
-                None, dx_cart, dg_cart, method=self.update_method,
-                symm=self.symm, lams=None, vecs=None
-            )
-            self.set_B(B)
-            return
+            if self.B is None and self._B_gpu is None:
+                B = np.zeros(self.shape, dtype=self.dtype)
+                self.initialized = True
+                dx_cart = dx[:self.ncart]
+                dg_cart = dg[:self.ncart]
+                B[:self.ncart, :self.ncart] = update_H(
+                    None, dx_cart, dg_cart, method=self.update_method,
+                    symm=self.symm, lams=None, vecs=None
+                )
+                self.set_B(B)
+                return
+            else:
+                # A caller supplied an explicit initial Hessian but asked to
+                # keep the "not yet updated" flag.  Use that Hessian as the
+                # baseline for the first update; do not discard it and
+                # bootstrap from a single secant pair.
+                self.initialized = True
 
-        self.set_B(update_H(B, dx, dg, method=self.update_method,
-                            symm=self.symm, lams=self.evals, vecs=self.evecs))
+        # Keep the large eigensystem on GPU when the GPU TS-BFGS path is
+        # available.  Downloading the full eigenvector matrix just to pass it
+        # through update_H is pure transfer overhead unless the GPU update
+        # falls back.
+        lams = None
+        vecs = None
+        B = None
+        B_gpu = self._get_B_gpu()
+        if B_gpu is not None:
+            if self._evals_gpu is None or self._evecs_gpu is None:
+                evals_t, evecs_t = gpu_eigh_t(B_gpu)
+                if evals_t is not None:
+                    self._evals_gpu = evals_t
+                    self._evecs_gpu = evecs_t
+            if not (
+                self.update_method == 'TS-BFGS'
+                and self._evals_gpu is not None
+                and self._evecs_gpu is not None
+            ):
+                B = self.asarray().copy()
+        if B_gpu is None:
+            B = self.asarray().copy()
+            lams, vecs = self.evals, self.evecs
 
-    def project(self, U: np.ndarray) -> 'ApproximateHessian':
+        result = update_H(B, dx, dg, method=self.update_method,
+                          symm=self.symm, lams=lams, vecs=vecs,
+                          B_gpu=self._B_gpu,
+                          evals_gpu=self._evals_gpu,
+                          evecs_gpu=self._evecs_gpu,
+                          download_numpy=False)
+        if isinstance(result, tuple):
+            Bplus_numpy, Bplus_gpu = result
+            self._set_from_gpu(Bplus_numpy, Bplus_gpu)
+        else:
+            self.set_B(result)
+
+    def project(self, U):
         """Project B into the subspace defined by U."""
         m, n = U.shape
         assert m == self.dim
 
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             Bproj = None
         else:
-            Bproj = U.T @ self.B @ U
+            Bproj = U.T @ self.asarray() @ U
 
         return ApproximateHessian(n, 0, Bproj, self.update_method,
                                   self.symm)
 
     def asarray(self):
         if self.B is not None:
+            self._sync_B_cpu()
+            return self.B
+        if self._B_gpu is not None:
+            self._sync_B_cpu()
             return self.B
         return np.eye(self.dim)
 
     def _matvec(self, v):
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             return v
-        return self.B @ v
+        if not self._cpu_current and self._B_gpu is not None:
+            vt = to_gpu(v)
+            if vt is not None:
+                try:
+                    return (self._B_gpu @ vt).cpu().numpy()
+                except (RuntimeError, MemoryError):
+                    _gpu_mod._record_oom(self._B_gpu.shape[0])
+        return self.asarray() @ v
 
     def _rmatvec(self, v):
         return self.matvec(v)
 
     def _matmat(self, X):
-        if self.B is None:
+        if self.B is None and self._B_gpu is None:
             return X
-        return self.B @ X
+        if not self._cpu_current and self._B_gpu is not None:
+            Xt = to_gpu(X)
+            if Xt is not None:
+                try:
+                    return (self._B_gpu @ Xt).cpu().numpy()
+                except (RuntimeError, MemoryError):
+                    _gpu_mod._record_oom(self._B_gpu.shape[0])
+        return self.asarray() @ X
 
     def _rmatmat(self, X):
         return self.matmat(X)
 
-    def __add__(self, other) -> 'ApproximateHessian':
+    def __add__(self, other):
         initialized = self.initialized
         if isinstance(other, ApproximateHessian):
             initialized = initialized and other.initialized
-            other = other.B
+            if other.B is None and other._B_gpu is None:
+                other = None
+            else:
+                other = other.asarray()
         if not self.initialized or other is None:
             tot = None
             initialized = False
         else:
-            tot = self.B + other
+            tot = self.asarray() + other
         return ApproximateHessian(
             self.dim, self.ncart, tot, self.update_method, self.symm,
             initialized=initialized,
         )
 
 
-# =============================================================================
-# Performance optimization: Replace nested Python loops with vectorized
-# numpy operations using np.add.at for scatter and np.sum for reduction.
-# This provides significant speedup for Jacobian assembly operations.
-# =============================================================================
-
 class SparseInternalJacobian(LinearOperator):
+    """Sparse internal-coordinate Jacobian as a LinearOperator.
+
+    Assembles/applies the ``(nints, 3*natoms)`` Jacobian from per-coordinate
+    atom ``indices`` and ``vals`` using vectorized numpy scatter/reduce
+    (``np.add.at`` / ``np.sum``) rather than Python loops.
+    """
+
     dtype = np.float64
 
     def __init__(
@@ -303,7 +463,7 @@ class SparseInternalJacobian(LinearOperator):
         self.indices = indices
         self.vals = vals
         self.nints = len(self.indices)
-        self.shape = (self.nints, 3 * self.natoms)
+        super().__init__(self.dtype, (self.nints, 3 * self.natoms))
 
     def asarray(self) -> np.ndarray:
         B = np.zeros((self.nints, self.natoms, 3))
@@ -332,13 +492,14 @@ class SparseInternalJacobian(LinearOperator):
         return w.ravel()
 
 
-# =============================================================================
-# Performance optimization: Use np.einsum for batched matrix-vector products
-# instead of nested Python loops with explicit indexing. This provides
-# ~7% speedup on Hessian computations.
-# =============================================================================
-
 class SparseInternalHessian(LinearOperator):
+    """Sparse ``(3*natoms, 3*natoms)`` Hessian of a single internal coordinate.
+
+    Stored as per-coordinate atom ``indices`` plus a dense ``vals`` block and
+    applied via ``np.einsum`` batched matrix-vector products rather than Python
+    loops over atom pairs.
+    """
+
     dtype = np.float64
 
     def __init__(
@@ -348,7 +509,7 @@ class SparseInternalHessian(LinearOperator):
         vals: np.ndarray,
     ) -> None:
         self.natoms = natoms
-        self.shape = (3 * self.natoms, 3 * self.natoms)
+        super().__init__(self.dtype, (3 * natoms, 3 * natoms))
         self.indices = np.asarray(indices)
         self.vals = np.asarray(vals)
 
@@ -391,87 +552,125 @@ class SparseInternalHessian(LinearOperator):
         return self._matvec(v)
 
 
-# =============================================================================
-# Performance optimization: Pre-compute batched index arrays and use
-# vectorized numpy operations for ldot (~14x faster) and rdot (~7.5x faster).
-# Hessians are grouped by size (number of atoms involved) to enable batching.
-# Uses np.einsum for batched matrix-vector products and np.add.at for scatter.
-# =============================================================================
+class SparseInternalHessiansSkeleton:
+    """Index-only data for SparseInternalHessians.
 
-class SparseInternalHessians:
-    def __init__(
-        self,
-        hessians: List[SparseInternalHessian],
-        ndof: int
-    ):
-        self.hessians = hessians
-        self.natoms = ndof // 3
-        self.shape = (len(self.hessians), ndof, ndof)
-        # Pre-compute batched data structures for vectorized operations
-        self._prepare_batched_data()
+    Holds the per-size groupings, atom-index arrays, and pre-computed flat
+    indices used by ldot/rdot. These derive only from the per-coord
+    ``indices`` and the global ``natoms`` — neither depends on the
+    coordinate Hessian *values* or atomic positions, so the skeleton can
+    be cached across optimizer steps and reused as long as the active
+    set of internal coordinates is unchanged.
+    """
 
-    def _prepare_batched_data(self):
-        """Pre-compute index arrays for vectorized ldot and rdot operations."""
-        # Group hessians by size (number of atoms involved)
+    def __init__(self, hessians: List[SparseInternalHessian], natoms: int):
+        self.natoms = natoms
+        self.n_hess = len(hessians)
+
+        # Group hessians by size (number of atoms involved).
         by_size = {}
-        for i, h in enumerate(self.hessians):
+        for i, h in enumerate(hessians):
             n = len(h.indices)
             if n not in by_size:
-                by_size[n] = {'orig_idx': [], 'indices': [], 'vals': []}
+                by_size[n] = {'orig_idx': [], 'indices': []}
             by_size[n]['orig_idx'].append(i)
             by_size[n]['indices'].append(h.indices)
-            by_size[n]['vals'].append(h.vals)
 
-        # Pre-compute the 3x3 index mesh for ldot
         i_idx, j_idx = np.meshgrid(np.arange(3), np.arange(3), indexing='ij')
         i_flat = i_idx.ravel()
         j_flat = j_idx.ravel()
 
-        self._batched_rdot = {}
-        self._batched_ldot = {}
+        # rdot only needs orig_idx + per-coord atom indices; vals are
+        # filled in per call by SparseInternalHessians.
+        self.rdot_meta = {}
+        # ldot also needs the precomputed flat 1D scatter index.
+        self.ldot_meta = {}
 
         for size, data in by_size.items():
             orig_idx = np.array(data['orig_idx'])
             indices = np.array(data['indices'])  # (batch, size)
-            vals = np.array(data['vals'])  # (batch, size, 3, size, 3)
             batch = len(orig_idx)
 
-            # For rdot: prepare gather/scatter indices
-            self._batched_rdot[size] = {
+            self.rdot_meta[size] = {
                 'orig_idx': orig_idx,
                 'indices': indices,
-                'vals': vals,
             }
 
-            # For ldot: prepare fully expanded index arrays
             n_pairs = size * size
-
-            # Create atom pair indices
             a_local, b_local = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
             a_local = a_local.ravel()
             b_local = b_local.ravel()
 
-            # Map to actual atom indices for each batch
             row_atoms = indices[:, a_local]  # (batch, size*size)
             col_atoms = indices[:, b_local]
-
-            # Expand for 3x3 blocks
             row_atoms = np.repeat(row_atoms, 9, axis=1)  # (batch, size*size*9)
             col_atoms = np.repeat(col_atoms, 9, axis=1)
             i_full = np.tile(i_flat, (batch, n_pairs))
             j_full = np.tile(j_flat, (batch, n_pairs))
 
-            # Reorder vals: (batch, size, 3, size, 3) -> (batch, size*size*9)
-            vals_reordered = vals.transpose(0, 1, 3, 2, 4)  # (batch, size, size, 3, 3)
-            vals_flat = vals_reordered.reshape(batch, -1)
+            # Pre-compute the flat 1D index used by the bincount-based ldot.
+            # M is (natoms, 3, natoms, 3); flat index =
+            # ((row*3 + i)*natoms + col)*3 + j.
+            linear_idx = ((row_atoms.ravel() * 3 + i_full.ravel())
+                          * natoms + col_atoms.ravel()) * 3 + j_full.ravel()
 
+            self.ldot_meta[size] = {
+                'orig_idx': orig_idx,
+                'linear_idx': linear_idx,
+                'batch': batch,
+                'n_pairs': n_pairs,
+            }
+
+
+class SparseInternalHessians:
+    def __init__(
+        self,
+        hessians: List[SparseInternalHessian],
+        ndof: int,
+        skeleton: 'SparseInternalHessiansSkeleton' = None,
+    ):
+        self.hessians = hessians
+        self.natoms = ndof // 3
+        self.shape = (len(self.hessians), ndof, ndof)
+
+        if skeleton is None:
+            skeleton = SparseInternalHessiansSkeleton(hessians, self.natoms)
+        elif skeleton.n_hess != len(hessians) or skeleton.natoms != self.natoms:
+            raise ValueError(
+                "skeleton was built for a different (n_hess, natoms); "
+                f"got skeleton ({skeleton.n_hess}, {skeleton.natoms}) vs "
+                f"this ({len(hessians)}, {self.natoms})"
+            )
+        self._skeleton = skeleton
+        self._build_value_views()
+
+    def _build_value_views(self):
+        """Stitch fresh per-coord vals onto the cached skeleton.
+
+        ``vals_flat`` is rebuilt on every call (it tracks atomic positions
+        via the per-coord Hessian values), but the index arrays are reused
+        from the skeleton.
+        """
+        hessians = self.hessians
+        self._batched_rdot = {}
+        self._batched_ldot = {}
+        for size, meta in self._skeleton.rdot_meta.items():
+            orig_idx = meta['orig_idx']
+            # Stack the current Hessian values for this size group.
+            vals = np.array([hessians[i].vals for i in orig_idx])
+            self._batched_rdot[size] = {
+                'orig_idx': orig_idx,
+                'indices': meta['indices'],
+                'vals': vals,
+            }
+            ldot_meta = self._skeleton.ldot_meta[size]
+            # Reorder vals: (batch, size, 3, size, 3) -> (batch, size*size*9)
+            vals_reordered = vals.transpose(0, 1, 3, 2, 4)
+            vals_flat = vals_reordered.reshape(ldot_meta['batch'], -1)
             self._batched_ldot[size] = {
                 'orig_idx': orig_idx,
                 'vals_flat': vals_flat,
-                'row_atoms': row_atoms,
-                'col_atoms': col_atoms,
-                'i_full': i_full,
-                'j_full': j_full,
+                'linear_idx': ldot_meta['linear_idx'],
             }
 
     def asarray(self) -> np.ndarray:
@@ -485,25 +684,23 @@ class SparseInternalHessians:
         return arr
 
     def ldot(self, v: np.ndarray) -> np.ndarray:
-        """Vectorized left dot: v^T @ D -> (ndof, ndof) matrix."""
-        M = np.zeros((self.natoms, 3, self.natoms, 3))
+        """Vectorized left dot: v^T @ D -> (ndof, ndof) matrix.
+
+        Uses np.bincount on a precomputed flat 1D index instead of np.add.at
+        on a 4D index. bincount handles duplicate indices in vectorized C
+        code, while np.add.at falls back to a Python-level loop for repeats.
+        On NACJAF (120 atoms, 72 constraints) this is ~2.5× faster.
+        """
+        n_dof = self.natoms * 3
+        M_flat = np.zeros(n_dof * n_dof)
 
         for size, data in self._batched_ldot.items():
-            orig_idx = data['orig_idx']
-            vals_flat = data['vals_flat']
-            row_atoms = data['row_atoms']
-            col_atoms = data['col_atoms']
-            i_full = data['i_full']
-            j_full = data['j_full']
+            weights = v[data['orig_idx']]
+            weighted = (data['vals_flat'] * weights[:, None]).ravel()
+            M_flat += np.bincount(data['linear_idx'], weights=weighted,
+                                  minlength=n_dof * n_dof)
 
-            weights = v[orig_idx]
-            weighted = vals_flat * weights[:, None]
-
-            np.add.at(M, (row_atoms.ravel(), i_full.ravel(),
-                         col_atoms.ravel(), j_full.ravel()),
-                      weighted.ravel())
-
-        return M.reshape(self.shape[1:])
+        return M_flat.reshape((n_dof, n_dof))
 
     def rdot(self, v: np.ndarray) -> np.ndarray:
         """Vectorized right dot: D @ v -> (nhess, ndof) matrix."""
