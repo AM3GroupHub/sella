@@ -485,11 +485,29 @@ class Sella(Optimizer):
             if self.pes.H.evals is None:
                 return True
             evals = self.pes.get_HL_projected(Unred).evals
-        # Diagonalize when the mode ordering is wrong in either direction: one
-        # of the lowest `ord` modes has turned positive, or a mode above `ord`
-        # has turned negative (i.e. a spurious extra imaginary frequency).
-        return bool((evals[:self.ord] > 0).any()
-                    or (evals[self.ord:] < 0).any())
+        # A mode that should be negative has turned positive.
+        if (evals[:self.ord] > 0).any():
+            return True
+        # Refuse to settle on a stationary point of the wrong index: a mode
+        # above `ord` has turned negative, i.e. a spurious extra imaginary
+        # frequency. Only checked once the forces are small enough that
+        # convergence might actually be declared -- on the approach, transient
+        # extra negative modes are routine, and re-diagonalizing on every one
+        # of them stalls the search (and can steer it onto a higher-index
+        # saddle).
+        if not (evals[self.ord:] < 0).any():
+            return False
+        return self._near_convergence()
+
+    def _near_convergence(self):
+        """True when the last convergence check was inside the force threshold.
+
+        Reads the cached result of the most recent converged() call rather
+        than recomputing it, so this costs nothing on the hot path.
+        """
+        if self.fmax is None or self._last_converged is None:
+            return False
+        return self._last_converged[1] <= self.fmax
 
     def _record_diagonalization(self, ev):
         if ev:
